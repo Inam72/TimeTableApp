@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beast Timetable Solver (Web)</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { margin-top: 0; color: #1a365d; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .panel { border: 1px solid #ddd; padding: 15px; border-radius: 6px; background: #fafafa; }
+        .panel h3 { margin-top: 0; border-bottom: 1px solid #ccc; padding-bottom: 5px; }
+        label { display: block; margin: 8px 0 4px; font-weight: 500; font-size: 14px; }
+        input[type="text"], input[type="file"], select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 10px; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #9ca3af; cursor: not-allowed; }
+        .results { margin-top: 20px; background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; max-height: 500px; overflow-y: auto; }
+        .day-row { display: flex; align-items: center; gap: 10px; margin-bottom: 5px; font-size: 14px; }
+        .day-row input[type="text"] { width: 70px; }
+        .day-row input[type="checkbox"] { margin: 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🦁 Beast Timetable Solver (Web)</h1>
+        <p>Select your CSV to start. Note: All processing happens in your browser.</p>
+        
+        <input type="file" id="csvFile" accept=".csv" />
+        <hr/>
+
+        <div class="grid">
+            <div class="panel">
+                <h3>Hard Constraints</h3>
+                <label><input type="checkbox" id="no830" checked> No lab starting at 8:30 AM</label>
+                <label>Global Earliest Start:</label>
+                <input type="text" id="minStart" value="8:30">
+                <label>Global Latest End:</label>
+                <input type="text" id="maxEnd" value="6:30">
+                
+                <h4 style="margin-top: 15px;">Per-Day Overrides (Optional)</h4>
+                <div id="dayOverrides">
+                    <!-- JS fills this -->
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>Course Toggle</h3>
+                <select id="courseToggle">
+                    <option value="EE213">EE 213 (Electric Circuits-II)</option>
+                    <option value="MATH113">CS/MATH 113 (Discrete Math)</option>
+                </select>
+                
+                <button id="solveBtn" disabled>🚀 SOLVE SCHEDULE</button>
+                <p id="status" style="font-size: 14px; color: #666;">Waiting for file...</p>
+            </div>
+        </div>
+
+        <div class="results" id="resultsBox">Results will appear here...</div>
+    </div>
+
+    <script>
+        // --- HELPERS ---
+        const parseTime = (s) => {
+            s = s.trim().toUpperCase();
+            if (!s) return -1;
+            let m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?$/);
+            if (!m) return -1;
+            let h = parseInt(m[1]), min = m[2] ? parseInt(m[2]) : 0, ampm = m[3];
+            if (!ampm) {
+                if (h === 12) ampm = 'PM';
+                else if (h > 12) ampm = 'PM';
+                else if (h >= 8) ampm = 'AM';
+                else ampm = 'PM';
+            }
+            if (h === 12) h = 0;
+            if (ampm === 'PM') h += 12;
+            return h * 60 + min;
+        };
+        const fmtTime = (m) => {
+            let h = Math.floor(m / 60), min = m % 60;
+            let ampm = h >= 12 ? 'PM' : 'AM';
+            h = h % 12 || 12;
+            return `${h}:${min.toString().padStart(2, '0')} ${ampm}`;
+        };
+        const parseDays = (s) => {
+            let out = [], i = 0;
+            s = s.trim();
+            while(i < s.length) {
+                if(s.substr(i,2) === 'Th') { out.push('Th'); i+=2; }
+                else if('MTWF'.includes(s[i])) { out.push(s[i]); i++; }
+                else i++;
+            }
+            return out;
+        };
+
+        // --- SETUP UI ---
+        const days = ["M", "T", "W", "Th", "F"];
+        const dayDiv = document.getElementById('dayOverrides');
+        days.forEach(d => {
+            let div = document.createElement('div');
+            div.className = 'day-row';
+            div.innerHTML = `
+                <input type="checkbox" id="chk_${d}">
+                <span style="width:20px;font-weight:bold">${d}</span>
+                <input type="text" id="start_${d}" value="8:30">
+                <span>to</span>
+                <input type="text" id="end_${d}" value="6:30">
+            `;
+            dayDiv.appendChild(div);
+        });
+
+        // --- SEARCH ENGINE ---
+        let sections = [];
+        
+        document.getElementById('csvFile').addEventListener('change', e => {
+            let file = e.target.files[0];
+            if (!file) return;
+            let reader = new FileReader();
+            reader.onload = ev => {
+                parseCSV(ev.target.result);
+                document.getElementById('solveBtn').disabled = false;
+                document.getElementById('status').innerText = `Loaded ${sections.length} sections.`;
+            };
+            reader.readAsText(file);
+        });
+
+        function parseCSV(text) {
+            sections = [];
+            let lines = text.split('\n');
+            let header = lines[0].split(',');
+            for(let i=1; i<lines.length; i++) {
+                let line = lines[i].trim();
+                if(!line) continue;
+                // Simple CSV parse (handles quotes)
+                let row = []; let inQuote = false; let curr = '';
+                for(let char of line) {
+                    if(char === '"') inQuote = !inQuote;
+                    else if(char === ',' && !inQuote) { row.push(curr); curr = ''; }
+                    else curr += char;
+                }
+                row.push(curr);
+                
+                let cn = row[6]?.trim();
+                if(!cn) continue;
+                try {
+                    let start = parseTime(row[9]);
+                    let end = parseTime(row[10]);
+                    if(start < 0 || end < 0) continue;
+                    
+                    let daysArr = parseDays(row[7]);
+                    let meetings = daysArr.map(d => ({day: d, start, end}));
+                    
+                    // Clean inst
+                    let rawInst = row[4] || '';
+                    let instClean = [...new Set(rawInst.split(';').map(s => s.trim()).filter(Boolean))].join(', ') || 'TBD';
+
+                    sections.push({
+                        nbr: cn, sub: row[1]?.trim(), cat: row[2]?.trim(), sec: row[5]?.trim(),
+                        inst: instClean, meetings
+                    });
+                } catch(e) {}
+            }
+        }
+
+        function conflict(a, b) {
+            for(let ma of a.meetings) {
+                for(let mb of b.meetings) {
+                    if(ma.day === mb.day && ma.start < mb.end && mb.start < ma.end) return true;
+                }
+            }
+            return false;
+        }
+
+        document.getElementById('solveBtn').addEventListener('click', () => {
+            let no830 = document.getElementById('no830').checked;
+            let minStart = parseTime(document.getElementById('minStart').value);
+            let maxEnd = parseTime(document.getElementById('maxEnd').value);
+            
+            let dayLimits = {};
+            days.forEach(d => {
+                if(document.getElementById(`chk_${d}`).checked) {
+                    dayLimits[d] = [
+                        parseTime(document.getElementById(`start_${d}`).value),
+                        parseTime(document.getElementById(`end_${d}`).value)
+                    ];
+                }
+            });
+
+            let toggle = document.getElementById('courseToggle').value;
+
+            // Map sections to components
+            let compDefs = [
+                {key: "CORE102 L1", sub: "CORE", cat: "102", pref: "L", fixed: "1046"},
+                {key: "CORE102 SEM", sub: "CORE", cat: "102", pref: "S"},
+                {key: "ENGR291L LEC", sub: "ENGR", cat: "291L", pref: "S", fixed: "1255"},
+                {key: "ENGR291L LAB", sub: "ENGR", cat: "291L", pref: "T"},
+                {key: toggle, sub: toggle === "EE213" ? "EE" : "CS/MATH", cat: toggle === "EE213" ? "213" : "113", pref: "L"},
+                {key: "DLD LEC", sub: "EE/CS", cat: "172/130", pref: "L"},
+                {key: "DLD LAB", sub: "EE/CS", cat: "172L/130L", pref: "T"},
+                {key: "DSA LEC", sub: "CS/CE", cat: "102/171", pref: "L"},
+                {key: "DSA LAB", sub: "CS/CE", cat: "102L/171L", pref: "T"},
+                {key: "MATH102 LEC", sub: "MATH", cat: "102", pref: "L"},
+                {key: "MATH102 REC", sub: "MATH", cat: "102", pref: "R"}
+            ];
+
+            let components = [];
+            for(let cd of compDefs) {
+                let opts = sections.filter(s => s.sub === cd.sub && s.cat === cd.cat && s.sec.startsWith(cd.pref));
+                
+                // Apply filters
+                opts = opts.filter(s => {
+                    if(cd.fixed) return s.nbr === cd.fixed;
+                    return s.meetings.every(m => {
+                        if(m.end > maxEnd || m.start < minStart) return false;
+                        if(cd.pref === "T" && no830 && m.start === 8*60+30) return false;
+                        if(dayLimits[m.day]) {
+                            if(m.start < dayLimits[m.day][0] || m.end > dayLimits[m.day][1]) return false;
+                        }
+                        return true;
+                    });
+                });
+
+                if(opts.length === 0) {
+                    alert(`Error: Course '${cd.key}' has no valid sections left!`);
+                    return;
+                }
+                components.push({key: cd.key, opts});
+            }
+
+            components.sort((a,b) => a.opts.length - b.opts.length);
+            
+            let best = [], selected = [];
+            let counter = 0;
+
+            // DFS Search
+            function dfs(i) {
+                if(i === components.length) {
+                    counter++;
+                    best.push([...selected]);
+                    best.sort((a, b) => {
+                        // Basic heuristic: fewer days & earlier starts
+                        let scoreA = 0, scoreB = 0;
+                        let daysA = new Set(), daysB = new Set();
+                        a.forEach(s => s.meetings.forEach(m => { daysA.add(m.day); scoreA += (16*60 - m.start); }));
+                        b.forEach(s => s.meetings.forEach(m => { daysB.add(m.day); scoreB += (16*60 - m.start); }));
+                        return (b.length ? 0 : 0) || (daysA.size - daysB.size) || (scoreB - scoreA);
+                    });
+                    if(best.length > 20) best.pop();
+                    return;
+                }
+                let opts = components[i].opts;
+                for(let s of opts) {
+                    if(selected.some(other => conflict(s, other))) continue;
+                    selected.push(s);
+                    dfs(i + 1);
+                    selected.pop();
+                }
+            }
+            
+            document.getElementById('status').innerText = "Solving...";
+            setTimeout(() => {
+                dfs(0);
+                renderResults(best);
+            }, 50);
+        });
+
+        function renderResults(best) {
+            let box = document.getElementById('resultsBox');
+            box.innerHTML = '';
+            if(best.length === 0) {
+                box.innerText = "No conflict-free schedules found.";
+                document.getElementById('status').innerText = "Done. 0 results.";
+                return;
+            }
+            
+            document.getElementById('status').innerText = `Done. Found ${best.length} schedules.`;
+            
+            best.slice(0, 5).forEach((sched, idx) => {
+                let text = `═══ RANK ${idx+1} ═══\n`;
+                let byDay = { M: [], T: [], W: [], Th: [], F: [] };
+                sched.forEach(s => s.meetings.forEach(m => byDay[m.day].push({start: m.start, end: m.end, s})));
+                
+                ["M", "T", "W", "Th", "F"].forEach(d => {
+                    if(byDay[d].length === 0) return;
+                    text += `  ${d}\n`;
+                    byDay[d].sort((a,b) => a.start - b.start).forEach(item => {
+                        let time = `${fmtTime(item.start)} - ${fmtTime(item.end)}`.padEnd(20);
+                        let course = `${item.s.sub} ${item.s.cat} ${item.s.sec}`.padEnd(15);
+                        let inst = `${item.s.inst}`.substring(0, 20).padEnd(22);
+                        text += `    ${time} | ${course} | ${inst}\n`;
+                    });
+                });
+                text += '\n' + '─'.repeat(60) + '\n\n';
+                box.innerText += text;
+            });
+        }
+    </script>
+</body>
+</html>
